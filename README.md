@@ -1,5 +1,6 @@
 # Rds-data-optimization
 Optimización y limpieza de bases de datos
+
 Plan de Optimización Administrativa
 Objetivo General: Centralizar la información, optimizar procesos, eliminar duplicidades y asegurar que los datos financieros y de inventario sean confiables para la toma de decisiones.
 1. Limpieza de Bases de Datos
