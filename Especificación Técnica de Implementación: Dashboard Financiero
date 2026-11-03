@@ -1,0 +1,271 @@
+# Especificación Técnica de Implementación: Dashboard Financiero
+
+**Arquitectura:** Híbrida (On-Premises ERP Memory G1000 vía ODBC + Google Sheets Cloud)  
+**Destino:** Modelo Semántico Power BI / Tabular Engine  
+**KPIs Clave:** EBITDA, FCO, DSO, Liquidez Corriente, Margen Bruto
+
+---
+
+## 1. Modelo de Datos en Estrella (Star Schema)
+
+El modelo adopta una granularidad a nivel de **renglón/apunte contable por asiento**. Para optimizar el rendimiento y evitar ambigüedades, todas las dimensiones filtran unidireccionalmente hacia la tabla de hechos ($1:\infty$).
+
+```
+        ┌──────────────────┐               ┌──────────────────┐
+        │     Dim_Fecha    │               │ Dim_CuentaContab │
+        └────────┬─────────┘               └────────┬─────────┘
+                 │ 1                                │ 1
+                 │                                  │
+                 │ *                                │ *
+         ┌───────┴──────────────────────────────────┴───────┐
+         │              Fact_MovimientosContables           │
+         └───────────────────────┬──────────────────────────┘
+                                 │ *
+                                 │ 
+                                 │ 1
+                        ┌────────┴─────────┐
+                        │    Dim_Cliente   │
+                        └──────────────────┘
+```
+
+### 1.1. Tablas de Dimensión
+
+#### A. `Dim_Fecha`
+*Tabla generada internamente en Power Query/DAX para garantizar continuidad temporal sin huecos.*
+
+| Campo | Tipo de Dato | Clave | Descripción / Reglas |
+| :--- | :--- | :---: | :--- |
+| `FechaKey` | `INTEGER` | **PK** | Formato `YYYYMMDD` (ej. 20261031). |
+| `Fecha` | `DATE` | | Fecha estándar (`DD/MM/YYYY`). |
+| `Anio` | `INTEGER` | | Año calendario (`YYYY`). |
+| `NumeroMes` | `INTEGER` | | Número de mes (1 al 12). |
+| `MesNombre` | `VARCHAR(20)` | | Nombre del mes (Enero, Febrero...). |
+| `MesAnio` | `VARCHAR(7)` | | Periodo contable (`YYYY-MM`). |
+| `Trimestre` | `VARCHAR(2)` | | Identificador (`T1`, `T2`, `T3`, `T4`). |
+| `DiasDelMes` | `INTEGER` | | Total de días del mes (28, 29, 30, 31). |
+
+#### B. `Dim_CuentaContable`
+*Clasifica el Plan de Cuentas de Memory G1000 para mapear P&L y Balance General.*
+
+| Campo | Tipo de Dato | Clave | Descripción / Reglas |
+| :--- | :--- | :---: | :--- |
+| `CuentaKey` | `INTEGER` | **PK** | Surrogate Key incremental o Hash. |
+| `CodigoCuenta` | `VARCHAR(30)` | | Código contable jerárquico (ej. `1.1.01.001`). |
+| `NombreCuenta` | `VARCHAR(150)`| | Descripción oficial de la cuenta. |
+| `Nivel1_Rubro` | `VARCHAR(50)` | | `Activo`, `Pasivo`, `Patrimonio`, `Pérdidas`, `Ganancias`. |
+| `Nivel2_Subrubro`| `VARCHAR(50)` | | `Activo Corriente`, `Pasivo Corriente`, `Ventas`, `Costos`, etc. |
+| `Naturaleza` | `VARCHAR(10)` | | `Deudora` o `Acreedora`. |
+| `AgrupadorEBITDA`| `VARCHAR(30)` | | Flag/Categoría: `Ventas`, `COGS`, `Gastos Operativos`, `Depreciacion_Amortizacion`, `Financiero`, `Impuestos`, `No Aplica`. |
+
+#### C. `Dim_Cliente`
+*Identificación de clientes para el análisis de CxC y DSO. Aquellos movimientos no asociados a clientes se mapean al registro comodín (`Key = -1`).*
+
+| Campo | Tipo de Dato | Clave | Descripción / Reglas |
+| :--- | :--- | :---: | :--- |
+| `ClienteKey` | `INTEGER` | **PK** | Surrogate Key (`-1` para "No Aplica / Asiento General"). |
+| `CodigoERP` | `VARCHAR(30)` | | Código único del cliente en Memory G1000. |
+| `NumeroIdentificacion` | `VARCHAR(20)`| | RUT / CI / CUIT del cliente. |
+| `RazonSocial` | `VARCHAR(150)`| | Nombre legal / Comercial. |
+| `PlazoCreditoDias` | `INTEGER` | | Plazo de cobro pactado (días estándar). |
+
+---
+
+### 1.2. Tabla de Hechos: `Fact_MovimientosContables`
+
+| Campo | Tipo de Dato | Clave | Descripción / Lógica de Transformación |
+| :--- | :--- | :---: | :--- |
+| `MovimientoID` | `BIGINT` | **PK** | Identificador único del renglón (`ID_Asiento + '-' + ID_Renglon`). |
+| `FechaKey` | `INTEGER` | **FK** | Referencia a `Dim_Fecha` (Fecha de contabilización). |
+| `CuentaKey` | `INTEGER` | **FK** | Referencia a `Dim_CuentaContable`. |
+| `ClienteKey` | `INTEGER` | **FK** | Referencia a `Dim_Cliente` (Null/0 se mapea a `-1`). |
+| `NumeroAsiento` | `VARCHAR(20)` | | Número oficial del asiento contable en Memory G1000. |
+| `TipoComprobante`| `VARCHAR(10)` | | Tipo (`DIARIO`, `VENTA`, `COBRO`, `AJUSTE`). |
+| `Debe` | `DECIMAL(18,2)`| | Importe al Debe en moneda local. |
+| `Haber` | `DECIMAL(18,2)`| | Importe al Haber en moneda local. |
+| `ImporteNeto` | `DECIMAL(18,2)`| | **Regla:** `Debe - Haber`. Facilita balanceo (`Sum = 0`). |
+| `ImporteSignadoFinanciero`| `DECIMAL(18,2)`| | Multiplicado por $+1$ o $-1$ según convención de presentación de P&L. |
+
+---
+
+## 2. Consulta SQL de Extracción Básica (Memory G1000 vía ODBC)
+
+Memory G1000 opera habitualmente sobre Microsoft SQL Server (o bases Sybase/Access en versiones legadas). La siguiente consulta T-SQL extrae los renglones contables normalizados, excluyendo asientos anulados y consolidando moneda nacional.
+
+```sql
+-- Extracción incremental/histórica de Asientos Contables desde Memory G1000
+SELECT 
+    -- Generación de Surrogate / Primary Key del hecho
+    CONCAT(CAST(A.NROASIENTO AS VARCHAR(15)), '-', CAST(R.RENGLON AS VARCHAR(10))) AS MovimientoID,
+    
+    -- Clave Fecha (YYYYMMDD)
+    CONVERT(INT, CONVERT(VARCHAR(8), A.FECHAASIENTO, 112)) AS FechaKey,
+    
+    -- Clave Foránea de Cuenta Contable
+    LTRIM(RTRIM(R.CODIGOCUENTA)) AS CodigoCuenta,
+    
+    -- Clave Foránea de Cliente (Si no existe relación en el renglón se asigna comodín 'NA')
+    COALESCE(LTRIM(RTRIM(R.CODIGOCLIENTE)), 'NA') AS CodigoCliente,
+    
+    A.NROASIENTO AS NumeroAsiento,
+    A.TIPOASIENTO AS TipoComprobante,
+    
+    -- Métricas monetarias (en Moneda Local / Pesos)
+    CAST(ISNULL(R.IMPORTE_DEBE, 0.00) AS DECIMAL(18,2)) AS Debe,
+    CAST(ISNULL(R.IMPORTE_HABER, 0.00) AS DECIMAL(18,2)) AS Haber,
+    CAST((ISNULL(R.IMPORTE_DEBE, 0.00) - ISNULL(R.IMPORTE_HABER, 0.00)) AS DECIMAL(18,2)) AS ImporteNeto,
+    
+    A.DETALLE AS ConceptoAsiento
+
+FROM dbo.M_ASIENTOS_CABECERA A
+INNER JOIN dbo.M_ASIENTOS_RENGLONES R 
+    ON A.ID_ASIENTO = R.ID_ASIENTO
+WHERE 
+    A.ESTADO <> 'ANULADO'
+    -- Filtro paramétrico: últimos 3 años móviles para optimización de carga
+    AND A.FECHAASIENTO >= DATEADD(YEAR, -3, GETDATE())
+ORDER BY 
+    A.FECHAASIENTO ASC, 
+    A.NROASIENTO ASC;
+```
+
+*Nota: Si el DSN ODBC conecta a un esquema donde las cuentas por cobrar se manejan en subcuentas por cliente, `CodigoCliente` se extrae mediante la descomposición del código de cuenta o tabla de auxiliares (`M_SUBCTAS`).*
+
+---
+
+## 3. Fórmulas de Medida (DAX)
+
+### 3.1. Ratio de Liquidez Corriente (Current Ratio)
+
+Calcula la capacidad de la empresa para cumplir sus obligaciones de corto plazo:
+$$\text{Liquidez Corriente} = \frac{\text{Activo Corriente}}{\text{Pasivo Corriente}}$$
+
+```dax
+// 1. Activo Corriente acumulado a la fecha máxima de contexto
+Activo_Corriente = 
+CALCULATE(
+    SUM(Fact_MovimientosContables[ImporteNeto]),
+    Dim_CuentaContable[Nivel2_Subrubro] = "Activo Corriente",
+    FILTER(
+        ALL(Dim_Fecha[Fecha]),
+        Dim_Fecha[Fecha] <= MAX(Dim_Fecha[Fecha])
+    )
+)
+
+// 2. Pasivo Corriente acumulado a la fecha máxima (se aplica ABS por convención de signo acreedor)
+Pasivo_Corriente = 
+ABS(
+    CALCULATE(
+        SUM(Fact_MovimientosContables[ImporteNeto]),
+        Dim_CuentaContable[Nivel2_Subrubro] = "Pasivo Corriente",
+        FILTER(
+            ALL(Dim_Fecha[Fecha]),
+            Dim_Fecha[Fecha] <= MAX(Dim_Fecha[Fecha])
+        )
+    )
+)
+
+// 3. Ratio de Liquidez Corriente
+Ratio_Liquidez_Corriente = 
+DIVIDE(
+    [Activo_Corriente], 
+    [Pasivo_Corriente], 
+    BLANK()
+)
+```
+
+---
+
+### 3.2. DSO (Days Sales Outstanding / Días de Cobro)
+
+Calcula el promedio de días que toma cobrar las ventas a crédito, evaluado sobre el periodo seleccionado (o estándar 365 días / 90 días):
+$$\text{DSO} = \frac{\text{Saldo CxC al Cierre}}{\text{Ventas Brutas a Crédito en el Periodo}} \times \text{Días del Periodo}$$
+
+```dax
+// 1. Saldo deudores por ventas al cierre del período filtrado
+Saldo_CxC_Cierre = 
+CALCULATE(
+    SUM(Fact_MovimientosContables[ImporteNeto]),
+    Dim_CuentaContable[Nivel2_Subrubro] = "Cuentas por Cobrar Comerciales",
+    FILTER(
+        ALL(Dim_Fecha[Fecha]),
+        Dim_Fecha[Fecha] <= MAX(Dim_Fecha[Fecha])
+    )
+)
+
+// 2. Ventas Totales del Periodo actual (crédito + contado según Plan de Cuentas)
+Ventas_Periodo = 
+ABS(
+    CALCULATE(
+        SUM(Fact_MovimientosContables[ImporteNeto]),
+        Dim_CuentaContable[AgrupadorEBITDA] = "Ventas"
+    )
+)
+
+// 3. Conteo dinámico de días transcurridos dentro del contexto de filtro
+Dias_En_Periodo = 
+COUNTROWS(Dim_Fecha)
+
+// 4. Medida DSO
+DSO_DiasCobro = 
+IF(
+    [Ventas_Periodo] > 0,
+    DIVIDE(
+        [Saldo_CxC_Cierre], 
+        [Ventas_Periodo]
+    ) * [Dias_En_Periodo],
+    BLANK()
+)
+```
+
+---
+
+## 4. Plan de Automatización (On-Premises Data Gateway)
+
+Para actualizar el modelo híbrido (Memory G1000 en servidor local + Google Sheets en nube) sin intervención manual, se debe implementar una puerta de enlace de datos estándar.
+
+```
+ [ Servidor Local / LAN ]                     [ Power BI Service (Cloud) ]
+ ┌──────────────────────┐                     ┌──────────────────────────┐
+ │ Memory G1000 (SQL)   │                     │  Programación:           │
+ └──────────┬───────────┘                     │  - Refresh: 06:00, 13:00 │
+            │                                 └─────────────┬────────────┘
+            ▼                                               │
+ ┌──────────────────────┐   HTTPS Outbound (443)            ▼
+ │ On-premises Gateway  ├────────────────────────────► Dataset Híbrido
+ └──────────────────────┘                                   ▲
+                                                            │ Web API (OAuth2)
+                                              ┌─────────────┴────────────┐
+                                              │ Google Sheets (Metas/FX) │
+                                              └──────────────────────────┘
+```
+
+### Paso 1: Configuración de Entorno y DSN en el Servidor
+1. Instalar el **On-premises Data Gateway (Modo Estándar / Enterprise)** en el servidor de base de datos de Memory G1000 o en una máquina virtual en la misma LAN con conectividad TCP continua.
+2. Abrir el **Administrador de orígenes de datos ODBC (64 bits)** en Windows Server.
+3. Crear un **System DSN (DSN de Sistema)** llamado `ODBC_MemoryG1000`.
+4. Configurar el driver nativo de la base de datos (SQL Server Native Client / OLE DB), registrar IP del host, credenciales con permisos estrictos de `db_datareader` y validar conectividad mediante el botón *"Test Data Source"*.
+
+### Paso 2: Registro del Origen en Power BI Service
+1. Ir a **Power BI Service (app.powerbi.com)** $\rightarrow$ **Configuración** $\rightarrow$ **Administrar conexiones y puertas de enlace**.
+2. Ubicar el cluster de la puerta de enlace instalada y hacer clic en **+ Nueva conexión**.
+3. Definir los parámetros:
+   * **Tipo de Conexión:** `ODBC`.
+   * **Cadena de Conexión:** `dsn=ODBC_MemoryG1000`.
+   * **Método de Autenticación:** `Básica` o `Windows`.
+   * **Nivel de Privacidad:** `Organizational` (crítico para permitir merge con fuentes en la nube).
+
+### Paso 3: Conexión con Google Sheets
+1. El informe de Power BI Desktop debe conectarse a Google Sheets usando el conector nativo `Google Sheets` vía URL del documento.
+2. En Power BI Service, ingresar a la configuración del Dataset $\rightarrow$ **Credenciales de origen de datos**.
+3. Autenticar la conexión de Google Sheets con **OAuth 2.0**, seleccionando la cuenta de servicio o corporativa correspondiente.
+4. Asignar el nivel de privacidad como **Organizational** (debe coincidir con la conexión ODBC para evitar el error de firewall de datos *Formula.Firewall / Cross-source evaluation*).
+
+### Paso 4: Mapeo y Programación de Actualizaciones
+1. En la configuración del Dataset en Power BI Service:
+   * Expandir la sección **Conexión de puerta de enlace**.
+   * Activar el switch *"Usar una puerta de enlace de datos"*.
+   * Mapear el origen ODBC local a la conexión creada en el Paso 2.
+2. Configurar la **Actualización programada**:
+   * **Frecuencia:** Diaria.
+   * **Horarios sugeridos:** Dos actualizaciones al día (06:00 AM para reflejar el cierre del día anterior; 13:00 PM para seguimiento intra-día).
+3. Activar alertas por correo electrónico ante fallos de refresh para el equipo de BI/Infraestructura.
